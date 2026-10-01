@@ -1,11 +1,9 @@
 import hashlib
 from typing import List, cast
 
-from pyasn1.type.univ import OctetString
-from pyasn1.codec.ber.decoder import decode as ber_decode
-from pyasn1_modules.rfc5280 import Certificate
-
+from cryptography import x509
 from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat import asn1
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from OpenSSL.crypto import (
     _PublicKey,
@@ -28,6 +26,7 @@ from webauthn.helpers.asn1.android_key import (
     KeyOrigin,
     KeyPurpose,
 )
+from webauthn.helpers.asn1.rfc5280 import Certificate
 from webauthn.helpers.exceptions import (
     InvalidCertificateChain,
     InvalidRegistrationResponse,
@@ -163,21 +162,18 @@ def verify_android_key(
             "Certificate public key did not match credential public key (Android Key)"
         )
 
-    attestation_cert_pyasn1, _ = ber_decode(attestation_cert_bytes, asn1Spec=Certificate())
-    attestation_cert_exts = attestation_cert_pyasn1["tbsCertificate"]["extensions"]
-
     # Verify that the attestationChallenge field in the attestation certificate
     # extension data is identical to clientDataHash.
     ext_key_description_oid = "1.3.6.1.4.1.11129.2.1.17"
     ext_key_description = None
     try:
-        # OIDs are best compared as tuples, but OIDs read easier as strings, so bridge that here
-        _ext_id = tuple(int(comp) for comp in ext_key_description_oid.split("."))
+        attestation_cert_asn1 = asn1.decode_der(Certificate, attestation_cert_bytes)
+        attestation_cert_exts = attestation_cert_asn1.tbsCertificate.extensions or []
 
         # Go through each extension and try to find one with a matching OID
-        for idx in range(0, len(attestation_cert_exts)):
-            extension = attestation_cert_exts.getComponentByPosition(idx)
-            if extension["extnID"]._value == _ext_id:
+        _ext_id = x509.ObjectIdentifier(ext_key_description_oid)
+        for extension in attestation_cert_exts:
+            if extension.extnID == _ext_id:
                 ext_key_description = extension
                 break
     except Exception as exc:
@@ -191,48 +187,47 @@ def verify_android_key(
         )
 
     # Parse the KeyDescription extension value
-    ext_value: OctetString = ext_key_description["extnValue"]
-    parsed_ext, trailing_garbage = ber_decode(ext_value, asn1Spec=KeyDescription())
-    if trailing_garbage:
+    try:
+        parsed_ext = asn1.decode_der(KeyDescription, ext_key_description.extnValue)
+    except Exception as exc:
         raise InvalidRegistrationResponse(
-            f"Extension {ext_key_description_oid} (Android key) has trailing garbage"
-        )
+            f"Extension {ext_key_description_oid} could not be parsed. See __cause__ for more info (Android Key)"
+        ) from exc
 
     # Verify that the attestationChallenge field in the attestation certificate extension data
     # is identical to clientDataHash.
-    attestation_challenge: OctetString = parsed_ext["attestationChallenge"]
-    if bytes(attestation_challenge) != client_data_hash_bytes:
+    if parsed_ext.attestationChallenge != client_data_hash_bytes:
         raise InvalidRegistrationResponse(
             "attestationChallenge field was not the same as the hash of clientDataJSON (Android Key)"
         )
 
     # Verify the following using the appropriate authorization list from the attestation
     # certificate extension data:
-    software_enforced: AuthorizationList = parsed_ext["softwareEnforced"]
-    tee_enforced: AuthorizationList = parsed_ext["teeEnforced"]
+    software_enforced: AuthorizationList = parsed_ext.softwareEnforced
+    tee_enforced: AuthorizationList = parsed_ext.teeEnforced
 
     # The AuthorizationList.allApplications field is not present on either authorization
     # list (softwareEnforced nor teeEnforced), since PublicKeyCredential MUST be scoped
     # to the RP ID.
-    if software_enforced["allApplications"].hasValue():
+    if software_enforced.allApplications is not None:
         raise InvalidRegistrationResponse(
             "allApplications field was present in softwareEnforced (Android Key)"
         )
 
-    if tee_enforced["allApplications"].hasValue():
+    if tee_enforced.allApplications is not None:
         raise InvalidRegistrationResponse(
             "allApplications field was present in teeEnforced (Android Key)"
         )
 
     # The value in the AuthorizationList.origin field is equal to KM_ORIGIN_GENERATED.
-    origin = tee_enforced["origin"]
+    origin = tee_enforced.origin
     if origin != KeyOrigin.GENERATED.value:
         raise InvalidRegistrationResponse(
             f"teeEnforced.origin {origin} was not {KeyOrigin.GENERATED}"
         )
 
     # The value in the AuthorizationList.purpose field is equal to KM_PURPOSE_SIGN.
-    purpose = tee_enforced["purpose"]
+    purpose = tee_enforced.purpose.as_list() if tee_enforced.purpose is not None else None
     if purpose != [KeyPurpose.SIGN.value]:
         raise InvalidRegistrationResponse(
             f"teeEnforced.purpose {purpose} was not [{KeyPurpose.SIGN}]"
